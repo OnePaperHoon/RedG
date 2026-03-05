@@ -1,0 +1,15 @@
+config.yaml
+client_secrets.json
+workspace/
+output/
+
+# Rust
+tui/target/
+
+# Node.js
+pipeline/node_modules/
+pipeline/dist/
+
+# Local / redundant
+.claude/settings.local.json
+AYG_spec_v5.docx

@@ -1,0 +1,27 @@
+{
+  "name": "ayg-pipeline",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "latest",
+    "@google/genai": "^1.44.0",
+    "fluent-ffmpeg": "latest",
+    "googleapis": "latest",
+    "js-yaml": "latest",
+    "mime": "^4.1.0",
+    "openai": "latest"
+  },
+  "devDependencies": {
+    "@types/fluent-ffmpeg": "latest",
+    "@types/js-yaml": "latest",
+    "@types/mime": "^3.0.4",
+    "@types/node": "latest",
+    "tsx": "latest",
+    "typescript": "^5"
+  }
+}
