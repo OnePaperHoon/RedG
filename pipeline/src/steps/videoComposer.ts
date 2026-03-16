@@ -59,10 +59,10 @@ function renderClip(scene: SceneInput, outputPath: string): Promise<void> {
       .outputOptions([
         '-pix_fmt yuv420p',
         '-shortest',
-        `-vf ${drawtextFilter}`,
         '-preset fast',
         '-crf 23',
       ])
+      .videoFilter(drawtextFilter)
       .output(outputPath)
       .on('end', () => resolve())
       .on('error', (err) => reject(new Error(`FFmpeg clip error: ${err.message}`)))

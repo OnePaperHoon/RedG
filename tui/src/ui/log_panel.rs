@@ -2,7 +2,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame,
 };
 use crate::app::LogEntry;
@@ -18,24 +18,32 @@ pub fn render(f: &mut Frame, area: Rect, logs: &std::collections::VecDeque<LogEn
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let height = inner.height as usize;
-    let lines: Vec<Line> = logs
-        .iter()
-        .rev()
-        .take(height)
-        .rev()
-        .map(|e| {
-            let (prefix, color) = match e.level.as_str() {
-                "error" => ("✕", Color::Red),
-                "warn"  => ("!", Color::Yellow),
-                _       => (">", GREEN),
-            };
-            Line::from(vec![
-                Span::styled(format!("{prefix} "), Style::default().fg(color)),
-                Span::styled(e.message.clone(), Style::default().fg(Color::White)),
-            ])
-        })
-        .collect();
+    let height    = inner.height as usize;
+    let prefix_w  = 2usize; // "✕ "
+    let msg_width = (inner.width as usize).saturating_sub(prefix_w).max(1);
 
-    f.render_widget(Paragraph::new(lines), inner);
+    // 최신 로그부터 역순으로 시각적 줄 수 누적, height 만큼 채울 항목 선택
+    let mut selected: Vec<&LogEntry> = Vec::new();
+    let mut used = 0usize;
+    for entry in logs.iter().rev() {
+        let visual = ((entry.message.chars().count() + msg_width - 1) / msg_width).max(1);
+        if used + visual > height { break; }
+        used += visual;
+        selected.push(entry);
+    }
+    selected.reverse();
+
+    let lines: Vec<Line> = selected.iter().map(|e| {
+        let (prefix, color) = match e.level.as_str() {
+            "error" => ("✕", Color::Red),
+            "warn"  => ("!", Color::Yellow),
+            _       => (">", GREEN),
+        };
+        Line::from(vec![
+            Span::styled(format!("{prefix} "), Style::default().fg(color)),
+            Span::styled(e.message.clone(), Style::default().fg(Color::White)),
+        ])
+    }).collect();
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }

@@ -93,6 +93,7 @@ async fn run_dashboard() -> anyhow::Result<()> {
 
 async fn dashboard_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<()> {
     let mut state = AppState::new();
+    load_workspace(&mut state);
 
     // IPC 채널
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<IpcEvent>();
@@ -141,7 +142,24 @@ async fn dashboard_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -
 // ── 키 처리 ───────────────────────────────────────────────────────────────────
 fn handle_key(state: &mut AppState, key: KeyEvent, cmd_tx: &mpsc::UnboundedSender<IpcCommand>) {
     match state.mode.clone() {
-        AppMode::Dashboard => ui::dashboard::handle_key(state, key),
+        AppMode::Dashboard => {
+            use ui::dashboard::DashboardAction;
+            if let Some(action) = ui::dashboard::handle_key(state, key) {
+                match action {
+                    DashboardAction::Resume { job_id, topic } => {
+                        if let Some(job) = state.job_mut(&job_id) {
+                            job.status   = JobStatus::Queued;
+                            job.progress = 0;
+                        }
+                        let _ = cmd_tx.send(IpcCommand::StartJob {
+                            job_id,
+                            topic,
+                            backend: state.backend.clone(),
+                        });
+                    }
+                }
+            }
+        }
 
         AppMode::NewJob => {
             match key.code { // key is Copy
@@ -350,6 +368,96 @@ fn handle_ipc_event(state: &mut AppState, event: IpcEvent) {
     }
 }
 
+// ── 워크스페이스 복원 ─────────────────────────────────────────────────────────
+fn load_workspace(state: &mut AppState) {
+    let workspace = match config::load_config() {
+        Ok(cfg) => cfg.ayg.workspace,
+        Err(_)  => return,
+    };
+    let ws_path = std::path::Path::new(&workspace);
+    if !ws_path.exists() { return; }
+
+    let entries = match std::fs::read_dir(ws_path) {
+        Ok(e)  => e,
+        Err(_) => return,
+    };
+
+    let mut jobs: Vec<Job> = Vec::new();
+
+    for entry in entries.flatten() {
+        let cp_path = entry.path().join("checkpoint.json");
+        if !cp_path.exists() { continue; }
+
+        let Ok(raw) = std::fs::read_to_string(&cp_path) else { continue };
+        let Ok(cp)  = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+
+        let job_id = cp["jobId"].as_str().unwrap_or("").to_string();
+        let topic  = cp["topic"].as_str().unwrap_or("(제목 없음)").to_string();
+        if job_id.is_empty() { continue; }
+
+        let mut job = Job::new(job_id.clone(), topic);
+
+        // 단계별 완료 상태 복원
+        for (name, step) in &[
+            ("script",  Step::Script),
+            ("images",  Step::Images),
+            ("tts",     Step::Tts),
+            ("compose", Step::Compose),
+            ("upload",  Step::Upload),
+        ] {
+            let done = cp["steps"][name]["done"].as_bool().unwrap_or(false);
+            job.steps.insert(step.clone(), if done { StepStatus::Done } else { StepStatus::Pending });
+        }
+
+        // 진행률 계산
+        job.progress = calc_progress(&job.steps);
+
+        // 상태 추론
+        let script_done          = cp["steps"]["script"]["done"].as_bool().unwrap_or(false);
+        let images_done          = cp["steps"]["images"]["done"].as_bool().unwrap_or(false);
+        let tts_done             = cp["steps"]["tts"]["done"].as_bool().unwrap_or(false);
+        let compose_done         = cp["steps"]["compose"]["done"].as_bool().unwrap_or(false);
+        let script_approved      = cp["scriptApproved"].as_bool().unwrap_or(false);
+        let image_config_approved = cp["imageConfigApproved"].as_bool().unwrap_or(false);
+
+        job.status = if compose_done {
+            JobStatus::Done
+        } else if tts_done {
+            JobStatus::Failed("중단됨 (영상 합성 전)".into())
+        } else if images_done {
+            JobStatus::Failed("중단됨 (TTS 전)".into())
+        } else if image_config_approved {
+            JobStatus::Failed("중단됨 (이미지 생성 중)".into())
+        } else if script_approved {
+            JobStatus::Failed("중단됨 (이미지 설정 전)".into())
+        } else if script_done {
+            JobStatus::Failed("중단됨 (스크립트 검토 전)".into())
+        } else {
+            JobStatus::Failed("중단됨 (스크립트 생성 중)".into())
+        };
+
+        // log.jsonl 로드 (최신 200줄)
+        let log_path = entry.path().join("log.jsonl");
+        if let Ok(log_raw) = std::fs::read_to_string(&log_path) {
+            for line in log_raw.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    let level   = v["level"].as_str().unwrap_or("info").to_string();
+                    let message = v["message"].as_str().unwrap_or("").to_string();
+                    let log_entry = LogEntry { job_id: job_id.clone(), level, message };
+                    if job.logs.len() >= 200 { job.logs.pop_front(); }
+                    job.logs.push_back(log_entry);
+                }
+            }
+        }
+
+        jobs.push(job);
+    }
+
+    // job_id(타임스탬프 기반) 기준 정렬
+    jobs.sort_by(|a, b| a.id.cmp(&b.id));
+    state.jobs = jobs;
+}
+
 // ── 유틸 ─────────────────────────────────────────────────────────────────────
 fn parse_step(s: &str) -> Step {
     match s {
@@ -363,9 +471,9 @@ fn parse_step(s: &str) -> Step {
 }
 
 fn calc_progress(steps: &std::collections::HashMap<Step, StepStatus>) -> u8 {
-    let total = 5u8;
-    let done  = steps.values().filter(|s| matches!(s, StepStatus::Done)).count() as u8;
-    done * 100 / total
+    let total = 5u16;
+    let done  = steps.values().filter(|s| matches!(s, StepStatus::Done)).count() as u16;
+    (done * 100 / total) as u8
 }
 
 fn timestamp_id() -> String {

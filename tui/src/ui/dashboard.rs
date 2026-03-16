@@ -11,8 +11,13 @@ use crate::app::{AppState, AppMode, Job, JobStatus, Step, StepStatus};
 const GREEN:  Color = Color::Rgb(0, 204, 102);
 const ORANGE: Color = Color::Rgb(255, 140, 0);
 
+// ── 액션 ─────────────────────────────────────────────────────────────────────
+pub enum DashboardAction {
+    Resume { job_id: String, topic: String },
+}
+
 // ── 키 처리 ───────────────────────────────────────────────────────────────────
-pub fn handle_key(state: &mut AppState, key: KeyEvent) {
+pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Option<DashboardAction> {
     // 대소문자 무관 처리 (Caps Lock / Shift 키 대응)
     let code = match key.code {
         KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
@@ -39,9 +44,20 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) {
                 state.mode = AppMode::Confirm(crate::app::ConfirmAction::DeleteJob(id));
             }
         }
+        KeyCode::Char('r') => {
+            if let Some(job) = state.selected_job() {
+                if matches!(job.status, JobStatus::Failed(_)) {
+                    return Some(DashboardAction::Resume {
+                        job_id: job.id.clone(),
+                        topic:  job.topic.clone(),
+                    });
+                }
+            }
+        }
         KeyCode::Char('q') => state.should_quit = true,
         _ => {}
     }
+    None
 }
 
 // ── 렌더링 ────────────────────────────────────────────────────────────────────
@@ -235,7 +251,7 @@ fn render_statusbar(f: &mut Frame, area: Rect, state: &AppState) {
 
 fn render_keyhint(f: &mut Frame, area: Rect) {
     let line = Line::from(Span::styled(
-        " j/k: Nav   Enter: Detail   n: New   d: Del   q: Quit",
+        " j/k: Nav   n: New   r: Resume(Failed)   d: Del   q: Quit",
         Style::default().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(line), area);

@@ -26,7 +26,7 @@ function waitFor<T>(type: string, jobId: string): Promise<T> {
 }
 
 // ── 체크포인트 ───────────────────────────────────────────────────────────────
-interface StepState { done: boolean; ts: string | null; }
+interface StepState { done: boolean; ts: string | null; completedScenes?: number[]; }
 
 interface Checkpoint {
   jobId:               string;
@@ -42,6 +42,20 @@ interface Checkpoint {
 
 function workspaceDir(jobId: string): string {
   return path.resolve(loadConfig().ayg.workspace, jobId);
+}
+
+function logPath(jobId: string): string {
+  return path.join(workspaceDir(jobId), 'log.jsonl');
+}
+
+function appendLog(jobId: string, level: string, message: string): void {
+  const entry = JSON.stringify({ ts: new Date().toISOString(), level, message }) + '\n';
+  try { fs.appendFileSync(logPath(jobId), entry); } catch { /* ignore */ }
+}
+
+function logAndSend(jobId: string, level: 'info' | 'warn' | 'error', message: string): void {
+  appendLog(jobId, level, message);
+  send({ type: 'log', jobId, level, message });
 }
 
 function cpPath(jobId: string): string {
@@ -106,7 +120,7 @@ export async function startJob(jobId: string, topic: string, backend: Backend): 
 
     // ★ 사용자 개입 #2 — ImageConfig
     if (step === 'images' && !cp.imageConfigApproved) {
-      send({ type: 'log', jobId, level: 'info', message: '이미지 설정을 기다리는 중...' });
+      logAndSend(jobId, 'info', '이미지 설정을 기다리는 중...');
       const cmd = await waitFor<{ type: 'image_config_approved'; jobId: string;
         globalStyle: string; globalNegative: string; scenes: ImageScene[] }>(
         'image_config_approved', jobId,
@@ -123,7 +137,9 @@ export async function startJob(jobId: string, topic: string, backend: Backend): 
       saveCp(cp);
       send({ type: 'step_done', jobId, step });
     } catch (e) {
-      send({ type: 'step_error', jobId, step, error: String(e) });
+      const errMsg = String(e);
+      appendLog(jobId, 'error', `[${step}] ${errMsg}`);
+      send({ type: 'step_error', jobId, step, error: errMsg });
       return;
     }
   }
@@ -134,7 +150,7 @@ export async function startJob(jobId: string, topic: string, backend: Backend): 
 
 // ── 사용자 승인 대기 (재생성 루프 포함) ─────────────────────────────────────
 async function waitForScriptApproval(jobId: string, cp: Checkpoint, wDir: string): Promise<void> {
-  send({ type: 'log', jobId, level: 'info', message: '스크립트 검토를 기다리는 중...' });
+  logAndSend(jobId, 'info', '스크립트 검토를 기다리는 중...');
 
   while (true) {
     type ApproveCmd = { type: 'script_approved';  jobId: string; scenes: EditedScene[] };
@@ -159,14 +175,14 @@ async function waitForScriptApproval(jobId: string, cp: Checkpoint, wDir: string
 
     // 재생성
     send({ type: 'step_start', jobId, step: 'script' });
-    send({ type: 'log', jobId, level: 'info', message: '스크립트 재생성 중...' });
+    logAndSend(jobId, 'info', '스크립트 재생성 중...');
     try {
       const newScript = await generateScript(cp.topic);
       cp.script = newScript;
       fs.writeFileSync(path.join(wDir, 'script.json'), JSON.stringify(newScript, null, 2));
       send({ type: 'step_done', jobId, step: 'script' });
       send({ type: 'script_ready', jobId, script: newScript });
-      send({ type: 'log', jobId, level: 'info', message: '스크립트 재생성 완료. 다시 검토해주세요.' });
+      logAndSend(jobId, 'info', '스크립트 재생성 완료. 다시 검토해주세요.');
     } catch (e) {
       send({ type: 'step_error', jobId, step: 'script', error: String(e) });
       throw e;
@@ -189,7 +205,7 @@ async function runStep(
     case 'tts':     return runTTS(jobId, cp, wDir);
     case 'compose': return runCompose(jobId, cp, wDir);
     case 'upload':
-      send({ type: 'log', jobId, level: 'info', message: 'Upload: Phase 2에서 구현 예정' });
+      logAndSend(jobId, 'info', 'Upload: Phase 2에서 구현 예정');
   }
 }
 
@@ -216,19 +232,29 @@ async function runImages(
   const scenes = cp.imageConfig.scenes;
   const total  = scenes.length;
 
+  if (!cp.steps.images.completedScenes) cp.steps.images.completedScenes = [];
+  const done = new Set(cp.steps.images.completedScenes);
+
   for (let i = 0; i < scenes.length; i++) {
     const s = scenes[i];
-    const outPath = path.join(wDir, 'images', `scene_${String(s.id).padStart(2, '0')}.png`);
+    if (done.has(s.id)) {
+      logAndSend(jobId, 'info', `이미지 씬 ${s.id} 이미 완료, 스킵`);
+      send({ type: 'step_update', jobId, step: 'images', progress: Math.round((i + 1) / total * 100), detail: `${i + 1}/${total}` });
+      continue;
+    }
 
+    const outPath = path.join(wDir, 'images', `scene_${String(s.id).padStart(2, '0')}.png`);
     const parts = [s.prompt, s.style, cp.imageConfig.globalStyle].filter(Boolean);
     const finalPrompt   = parts.join(', ');
     const finalNegative = [s.negative, cp.imageConfig.globalNegative].filter(Boolean).join(', ');
 
     send({ type: 'step_update', jobId, step: 'images', progress: Math.round(i / total * 100), detail: `${i + 1}/${total}` });
-    send({ type: 'log', jobId, level: 'info', message: `이미지 생성 ${i + 1}/${total}` });
+    logAndSend(jobId, 'info', `이미지 생성 ${i + 1}/${total} (씬 ${s.id})`);
 
     await generateImage(finalPrompt, finalNegative, outPath, backend);
 
+    cp.steps.images.completedScenes!.push(s.id);
+    saveCp(cp);
     send({ type: 'step_update', jobId, step: 'images', progress: Math.round((i + 1) / total * 100), detail: `${i + 1}/${total}` });
   }
 }
@@ -239,15 +265,26 @@ async function runTTS(jobId: string, cp: Checkpoint, wDir: string): Promise<void
     cp.editedScript?.scenes ?? cp.script.scenes;
   const total = scenes.length;
 
+  if (!cp.steps.tts.completedScenes) cp.steps.tts.completedScenes = [];
+  const done = new Set(cp.steps.tts.completedScenes);
+
   for (let i = 0; i < scenes.length; i++) {
-    const s       = scenes[i];
+    const s = scenes[i];
+    if (done.has(s.id)) {
+      logAndSend(jobId, 'info', `TTS 씬 ${s.id} 이미 완료, 스킵`);
+      send({ type: 'step_update', jobId, step: 'tts', progress: Math.round((i + 1) / total * 100), detail: `${i + 1}/${total}` });
+      continue;
+    }
+
     const outPath = path.join(wDir, 'audio', `scene_${String(s.id).padStart(2, '0')}.mp3`);
 
     send({ type: 'step_update', jobId, step: 'tts', progress: Math.round(i / total * 100), detail: `${i + 1}/${total}` });
-    send({ type: 'log', jobId, level: 'info', message: `TTS 생성 ${i + 1}/${total}` });
+    logAndSend(jobId, 'info', `TTS 생성 ${i + 1}/${total} (씬 ${s.id})`);
 
     await generateTTS(s.narration, outPath);
 
+    cp.steps.tts.completedScenes!.push(s.id);
+    saveCp(cp);
     send({ type: 'step_update', jobId, step: 'tts', progress: Math.round((i + 1) / total * 100), detail: `${i + 1}/${total}` });
   }
 }
@@ -265,7 +302,7 @@ async function runCompose(jobId: string, cp: Checkpoint, wDir: string): Promise<
     duration:  s.duration,
   }));
 
-  send({ type: 'log', jobId, level: 'info', message: '영상 합성 중...' });
+  logAndSend(jobId, 'info', '영상 합성 중...');
 
   const clipPath = path.join(wDir, 'output.mp4');
   await composeVideo(inputs, clipPath);
@@ -275,5 +312,5 @@ async function runCompose(jobId: string, cp: Checkpoint, wDir: string): Promise<
   fs.mkdirSync(path.dirname(finalPath), { recursive: true });
   fs.copyFileSync(clipPath, finalPath);
 
-  send({ type: 'log', jobId, level: 'info', message: `영상 완성: ${finalPath}` });
+  logAndSend(jobId, 'info', `영상 완성: ${finalPath}`);
 }
